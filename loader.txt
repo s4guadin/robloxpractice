@@ -1,2 +1,2 @@
--- PracticeIntro Loader - cole esta unica linha no Solara
-loadstring(game:HttpGet("https://raw.githubusercontent.com/s4guadin/robloxpractice/main/PracticeIntro.lua"))()
+-- Practice Loader - cole esta unica linha no Solara
+loadstring(game:HttpGet("https://raw.githubusercontent.com/s4guadin/robloxpractice/main/Practice.lua"))()
