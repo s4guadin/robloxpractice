@@ -1,8 +1,14 @@
 local BLOCKED_PLACE_ID=114234929420007
 if game.PlaceId==BLOCKED_PLACE_ID then
-warn("esse jogo tem proteção anti-menu do nosso sistema, não é possível usar neste jogo")
-return
+    warn("esse jogo tem proteção anti-menu do nosso sistema, não é possível usar neste jogo")
+    return
 end
+
+-- SISTEMA DE KEY / LICENÇA
+-- false = abre direto no menu: nenhuma key é pedida, o Worker não é contatado e
+-- não existe revalidação horária. O bloco AUTH inteiro continua no arquivo, então
+-- reativar é só trocar isto para true.
+local KEY_SYSTEM_ENABLED=false
 
 --[[
     PRACTICE+ - AI-FRIENDLY BUILD
@@ -2825,11 +2831,20 @@ end)()
 
 local sk=AUTH.savedKey()
 local access,why,kind=false,nil,nil
+if KEY_SYSTEM_ENABLED then
 if sk~=""then
  access,why,kind=AUTH.verifyKey(sk)
  if not access and(kind=="invalid_key"or kind=="blocked_key"or kind=="expired_key"or kind=="device_mismatch"or kind=="hardware_mismatch"or kind=="roblox_user_mismatch"or kind=="product_mismatch"or kind=="invalid_product")then AUTH.clearStoredKey()sk=""end
 end
 if not access and not AUTH.keyGate(sk,why)then return end
+else
+ -- Sem key: o menu abre direto. So preenche o minimo para a UI do Home nao mostrar campos vazios.
+ access=true
+ AUTH.LIC.authorized=true
+ AUTH.LIC.username=P.LocalPlayer.Name
+ AUTH.LIC.plan="free"
+ AUTH.LIC.tier="free"
+end
 
 -- A rota veio junto da resposta autenticada do Worker. Nenhuma leitura de GitHub
 -- acontece no executor/client.
@@ -2845,7 +2860,7 @@ ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 })
 
 task.spawn(function()
-	while gui.Parent do
+	while KEY_SYSTEM_ENABLED and gui.Parent do
 		task.wait(LICENSE_REVALIDATE_SECONDS)
 
 		if not gui.Parent then
@@ -5272,7 +5287,7 @@ Parent=cardHome,
 Position=UDim2.fromOffset(100,13),
 Size=UDim2.new(1,-116,0,21),
 BackgroundTransparency=1,
-Text="Autenticado",
+Text=KEY_SYSTEM_ENABLED and"Autenticado"or"Free",
 Font=Enum.Font.GothamBold,
 TextSize=14,
 TextColor3=Color3.fromRGB(232,232,238),
@@ -5450,7 +5465,7 @@ Parent=detail,
 Position=UDim2.fromOffset(15,9),
 Size=UDim2.new(1,-30,0,18),
 BackgroundTransparency=1,
-Text="Key  "..maskKey(AUTH.LIC.key),
+Text=KEY_SYSTEM_ENABLED and("Key  "..maskKey(AUTH.LIC.key))or"Key  desativada",
 Font=Enum.Font.Code,
 TextSize=9,
 TextColor3=Color3.fromRGB(151,153,166),
@@ -5474,7 +5489,7 @@ Parent=detail,
 Position=UDim2.fromOffset(15,52),
 Size=UDim2.new(1,-30,0,14),
 BackgroundTransparency=1,
-Text="Revalidação: 60 min  •  "..routeScript,
+Text=KEY_SYSTEM_ENABLED and("Revalidacao: 60 min  •  "..routeScript)or("Sem key  •  "..routeScript),
 Font=Enum.Font.Gotham,
 TextSize=8,
 TextColor3=Color3.fromRGB(81,83,96),
