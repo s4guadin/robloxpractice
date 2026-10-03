@@ -48,6 +48,7 @@ local DEBUG_CLICK_TP=false
 ]]
 
 P,T,A,X=game:GetService("Players"),game:GetService("TweenService"),game:GetService("AssetService"),game:GetService("TextService")
+local SoundSvc,Repl,TeamsSvc=game:GetService("SoundService"),game:GetService("ReplicatedStorage"),game:GetService("Teams")
 local pg=P.LocalPlayer:WaitForChild("PlayerGui")
 local o=pg:FindFirstChild("PracticeIntro")
 if o then o:Destroy()end
@@ -4054,8 +4055,302 @@ hitboxExpand=false,
 hitboxSize=1.5,
 antiAfk=false,
 zoomFOV=0,
+aimMaxDist=600,
+aimOnlyVisible=true,
+aimPredict=true,
+aimProjSpeed=0,
+aimShowFov=false,
+espDistance=false,
+espHealth=false,
+espFade=false,
+espMinDist=0,
+espMaxDist=2000,
+gravityOn=false,
+gravity=196.2,
+triggerOn=false,
+triggerDelay=120,
+notify=true,
+sound=false,
+soundId="",
+saveCfg=true,
+recordBinds=true,
 theme=1
 }
+
+-- ============================================================
+-- 3.1) REGISTRO DE CONTROLES + CONFIG PERSISTENTE
+-- controls[title] = handle do toggle/slider criado na UI. O mapa
+-- CONTROL_KEYS liga o titulo visivel ao campo real dentro de SET e e
+-- ele que permite salvar, restaurar e recriar os atalhos de teclado.
+--
+-- Formato do arquivo (uma linha por entrada, sem escapes):
+--   b <campo> <0|1>   booleano de SET
+--   s <campo> <numero> numero de SET
+--   c <r> <g> <b>     cor do ESP
+--   k <Titulo>|<Tecla> atalho de teclado
+-- ============================================================
+local controls={}
+
+-- Declaracoes antecipadas: NOTIFY/KEYBINDS/AIM sao construidos na secao de
+-- runtime, mas precisam ser referenciados por mkToggle, pelo CONFIG e pelo
+-- auto trigger. Sem o forward declaration o Luau trataria isto como global.
+local NOTIFY=nil
+local KEYBINDS=nil
+local AIM_TARGET=nil
+local AIM_HP=nil
+
+local CONTROL_KEYS={
+["Aimbot"]="aimbotEnabled",
+["FOV do Aimbot"]="aimFOV",
+["Suavidade do Aimbot"]="aimSmooth",
+["Distancia maxima do Aimbot"]="aimMaxDist",
+["So alvos visiveis"]="aimOnlyVisible",
+["Predicao de movimento"]="aimPredict",
+["Velocidade do projetil"]="aimProjSpeed",
+["Mostrar circulo do FOV"]="aimShowFov",
+["Velocidade"]="walkSpeed",
+["Forca do pulo"]="jumpPower",
+["Sem dano de queda"]="noFallDamage",
+["God Mode"]="godMode",
+["Hitbox expandido"]="hitboxExpand",
+["Tamanho do Hitbox"]="hitboxSize",
+["Fly"]="flyEnabled",
+["Velocidade do Fly"]="flySpeed",
+["Noclip"]="noclipEnabled",
+["Gravidade"]="gravityOn",
+["Forca da gravidade"]="gravity",
+["Click TP"]="clickTp",
+["Free Cam"]="freecamEnabled",
+["Velocidade da Free Cam"]="freecamSpeed",
+["ESP"]="espEnabled",
+["ESP cor da equipe"]="espTeamColor",
+["Nomes acima da cabeca"]="espNames",
+["Distancia no ESP"]="espDistance",
+["Vida (HP) no ESP"]="espHealth",
+["Fade por distancia"]="espFade",
+["Distancia minima do ESP"]="espMinDist",
+["Distancia maxima do ESP"]="espMaxDist",
+["Tracers"]="espTracers",
+["Caixas (Boxes)"]="espBoxes",
+["Mostrar voce no ESP"]="espShowSelf",
+["Auto trigger"]="triggerOn",
+["Delay do trigger"]="triggerDelay",
+["Anti-afk"]="antiAfk",
+["Zoom da camera (FOV)"]="zoomFOV",
+["Notificacoes"]="notify",
+["Sons"]="sound",
+["Salvar config"]="saveCfg",
+["Gravar atalhos"]="recordBinds"
+}
+
+local CONFIG=(function()
+local FILE=KEY_DIR.."/config.json"
+local dirty=false
+local timer=nil
+
+local function dump()
+local out={}
+local n=0
+local function push(s)
+n=n+1
+out[n]=s
+end
+
+for k,v in pairs(SET)do
+local t=type(v)
+
+if t=="boolean" then
+push("b "..k.." "..(v and "1" or "0"))
+elseif t=="number" and v==v and v~=math.huge and v~=-math.huge then
+push("s "..k.." "..string.format("%.6g",v))
+end
+end
+
+local c=SET.espColor
+
+push(("c %d %d %d"):format(
+math.round(c.R*255),
+math.round(c.G*255),
+math.round(c.B*255)
+))
+
+if KEYBINDS then
+for _,b in ipairs(KEYBINDS.Dump())do
+push("k "..b[1].."|"..b[2])
+end
+end
+
+return table.concat(out,"\n")
+end
+
+local function save()
+if not SET.saveCfg then
+return false
+end
+
+if not fwrite(FILE,dump())then
+return false
+end
+
+dirty=false
+
+return true
+end
+
+local function markDirty()
+if not SET.saveCfg or dirty then
+return
+end
+
+dirty=true
+
+if timer then
+return
+end
+
+timer=task.delay(1.2,function()
+timer=nil
+pcall(save)
+end)
+end
+
+local function load()
+local raw=fread(FILE)
+
+if not raw then
+return false
+end
+
+local nums={}
+local bools={}
+local binds={}
+local nb=0
+local got=false
+local pending=nil
+
+for line in raw:gmatch("[^\r\n]+")do
+line=trim(line)
+
+-- Separa so o tipo do resto. O resto precisa ser lido por tipo: um atalho
+-- ("k Aimbot|KeyB") tem espacos no titulo, entao um token unico nao serviria.
+local kind,rest=line:match("^(%a) (.*)$")
+
+if kind then
+if kind=="b" then
+local a,v=rest:match("^(%S+) (0|1)$")
+
+if a and type(SET[a])=="boolean" then
+bools[a]=v=="1"
+got=true
+end
+elseif kind=="s" then
+local a,v=rest:match("^(%S+) (.-)$")
+local n=tonumber(v)
+
+if a and n and type(SET[a])=="number" then
+nums[a]=n
+got=true
+end
+elseif kind=="c" then
+local r,g,bl=rest:match("^(%d+) (%d+) (%d+)$")
+
+if r then
+nums.espR=tonumber(r)
+nums.espG=tonumber(g)
+nums.espB=tonumber(bl)
+got=true
+end
+elseif kind=="k" then
+local t,k=rest:match("^(.-)|(.+)$")
+
+if t and k then
+nb=nb+1
+binds[nb]={t,k}
+got=true
+end
+end
+end
+end
+
+if not got then
+return false
+end
+
+for k,v in pairs(bools)do
+SET[k]=v
+end
+
+for k,v in pairs(nums)do
+if k=="espR" or k=="espG" or k=="espB" then
+continue
+end
+
+SET[k]=v
+end
+
+if nums.espR and nums.espG and nums.espB then
+SET.espColor=Color3.fromRGB(
+math.clamp(math.round(nums.espR),0,255),
+math.clamp(math.round(nums.espG),0,255),
+math.clamp(math.round(nums.espB),0,255)
+)
+end
+
+if nb>0 then
+if KEYBINDS then
+KEYBINDS.Load(binds)
+else
+-- KEYBINDS ainda nao existe quando a config carrega: ele puxa CONFIG.Binds
+-- quando for criado.
+pending=binds
+end
+end
+
+return true
+end
+
+local function apply()
+for title,key in pairs(CONTROL_KEYS)do
+local ctl=controls[title]
+
+if ctl and key~="recordBinds" and SET[key]~=nil then
+pcall(function()
+ctl.set(SET[key],true)
+end)
+end
+end
+
+local c=SET.espColor
+
+for _,pair in ipairs({
+{title="Vermelho",v=c.R*255},
+{title="Verde",v=c.G*255},
+{title="Azul",v=c.B*255}
+})do
+local ctl=controls[pair.title]
+
+if ctl then
+pcall(function()
+ctl.set(pair.v,true)
+end)
+end
+end
+end
+
+load()
+
+return{
+Save=save,
+Load=load,
+Apply=apply,
+GetBinds=function()
+load()
+return pending
+end,
+MarkDirty=markDirty,
+File=FILE
+}
+end)()
 
 local ESP_FOLDERS={
 "Zombie",
@@ -4228,23 +4523,45 @@ TextColor3=Color3.fromRGB(229,229,235)
 },Enum.EasingStyle.Quad)
 end)
 
-btn.MouseButton1Click:Connect(function()
-state=not state
-refresh(false)
+-- set(v,fire,instant): fire=true executa onChange (usado pelo CONFIG ao
+-- restaurar e pelos atalhos de teclado); instant=true pula a animacao.
+local function set(v,fire,instant)
+state=v
+refresh(instant==true)
 
+if fire then
 onChange(state)
+end
+end
+
+btn.MouseButton1Click:Connect(function()
+set(not state,true)
+
+if NOTIFY
+and SET.notify then
+
+NOTIFY.Show(
+title..(state and": ligado" or": desligado"),
+state and"on" or"off"
+)
+end
+
+CONFIG.MarkDirty()
 end)
 
-return {
-set=function(v)
-state=v
-refresh(false)
-end,
+local ctl={
+set=set,
 
 get=function()
 return state
-end
+end,
+
+title=title
 }
+
+controls[title]=ctl
+
+return ctl
 end
 
 local sliderSetters={}
@@ -4351,11 +4668,12 @@ thumb.Position=UDim2.fromScale(frac,.5)
 
 if not silent then
 onChange(value)
+CONFIG.MarkDirty()
 end
 end
 
-local function setByValue(v)
-update((v-minV)/(maxV-minV),true)
+local function setByValue(v,fire)
+update((v-minV)/(maxV-minV),not fire)
 end
 
 local function dragTo(pos)
@@ -4415,17 +4733,424 @@ end
 end)
 
 update((val-minV)/(maxV-minV))
-sliderSetters[title]=setByValue
-return {
+
+local ctl={
 set=setByValue,
 
 get=function()
 return minV+(fill.Size.X.Scale)*(maxV-minV)
 end,
 
-frame=c
+frame=c,
+title=title
 }
+
+sliderSetters[title]=setByValue
+controls[title]=ctl
+
+return ctl
 end
+
+-- ============================================================
+-- NOTIFICAÇÕES + SOM
+-- Toasts no canto superior direito. O som e opcional e so toca se
+-- SET.soundId tiver um rbxassetid:// valido (o padrao e vazio, ou seja,
+-- silencioso, para nao depender de nenhum asset externo).
+-- ============================================================
+NOTIFY=(function()
+local made,sg=pcall(function()
+local g=N("ScreenGui",{
+Name="PracticeNotify",
+Parent=pg,
+ResetOnSpawn=false,
+IgnoreGuiInset=true,
+ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+})
+
+g.DisplayOrder=60
+
+return g
+end)
+
+if not made or not sg then
+return{Show=function() end,Sound=function() end}
+end
+
+local box=N("Frame",{
+Parent=sg,
+AnchorPoint=Vector2.new(1,0),
+Position=UDim2.fromOffset(-14,64),
+Size=UDim2.fromOffset(268,0),
+BackgroundTransparency=1
+})
+
+box.AutomaticSize=Enum.AutomaticSize.Y
+
+local live={}
+
+local function toast(text,kind)
+local col=ACCENT
+
+if kind=="off" then
+col=Color3.fromRGB(120,122,134)
+elseif kind=="warn" then
+col=Color3.fromRGB(255,170,60)
+elseif kind=="err" then
+col=Color3.fromRGB(235,80,80)
+end
+
+local panel=N("Frame",{
+Parent=box,
+Size=UDim2.new(1,0,0,40),
+BackgroundColor3=Color3.fromRGB(22,22,27),
+BorderSizePixel=0
+})
+
+local stroke=N("UIStroke",{
+Parent=panel,
+Color=col,
+Transparency=.4,
+Thickness=1
+})
+
+N("UICorner",{Parent=panel,CornerRadius=UDim.new(0,8)})
+
+local bar=N("Frame",{
+Parent=panel,
+Size=UDim2.fromOffset(3,26),
+Position=UDim2.fromOffset(9,7),
+BackgroundColor3=col,
+BorderSizePixel=0
+})
+
+R(bar,2)
+
+N("TextLabel",{
+Parent=panel,
+Position=UDim2.fromOffset(20,0),
+Size=UDim2.new(1,-32,1,0),
+BackgroundTransparency=1,
+Text=tostring(text),
+Font=Enum.Font.GothamMedium,
+TextSize=12,
+TextColor3=W,
+TextWrapped=true,
+TextXAlignment=Enum.TextXAlignment.Left,
+TextYAlignment=Enum.TextYAlignment.Center
+})
+
+local entry={panel=panel,stroke=stroke}
+live[#live+1]=entry
+
+task.spawn(function()
+panel.Position=UDim2.fromOffset(18,0)
+Q(panel,D(.20),{Position=UDim2.fromOffset(0,0)},Enum.EasingStyle.Quint)
+task.wait(2.7)
+Q(panel,D(.16),{
+Position=UDim2.fromOffset(18,0),
+BackgroundTransparency=1
+},Enum.EasingStyle.Quad)
+Q(stroke,D(.16),{Transparency=1},Enum.EasingStyle.Quad)
+task.wait(.2)
+pcall(function()
+panel:Destroy()
+end)
+
+for i,v in ipairs(live)do
+if v==entry then
+table.remove(live,i)
+break
+end
+end
+end)
+end
+
+local Sound
+
+local function Show(text,kind)
+if not SET.notify then
+return
+end
+
+toast(text,kind)
+Sound(kind)
+end
+
+Sound=function(kind)
+if not SET.sound
+or not SET.notify
+or type(SET.soundId)~="string"
+or SET.soundId=="" then
+return
+end
+
+pcall(function()
+local s=N("Sound",{
+SoundId=SET.soundId,
+Volume=kind=="on" and .3 or .18
+})
+
+s.Parent=SoundSvc
+s:Play()
+task.delay(2,function()
+pcall(function()
+s:Destroy()
+end)
+end)
+end)
+end
+
+return{
+Show=Show,
+Sound=Sound,
+Gui=sg
+}
+end)()
+
+-- ============================================================
+-- ATALHOS DE TECLADO
+-- Cada atalho aponta para o titulo de um toggle que ja existe na UI, entao ele
+-- age pelo mesmo handle guardado em controls[title]: o toggle visual anima, o
+-- onChange roda (fly/noclip/ESP funcionam) e o CONFIG e marcado como sujo.
+-- Por padrao nenhum tecla vem gravada para nao conflitar com o movimento do
+-- jogo; clique na linha e aperte a tecla desejada (Esc cancela).
+-- ============================================================
+KEYBINDS=(function()
+local LIST={
+"Aimbot",
+"ESP",
+"Fly",
+"Noclip",
+"Click TP",
+"Free Cam",
+"Auto trigger",
+"God Mode",
+"Hitbox expandido",
+"Gravidade",
+"Distancia no ESP",
+"Sem dano de queda"
+}
+
+local map={}
+local rows={}
+local waiting=nil
+local waitingLbl=nil
+
+local function flash(lbl)
+local t=lbl.Text
+lbl.Text="..."
+task.delay(1.6,function()
+if lbl.Text=="..." then
+lbl.Text=t
+end
+end)
+end
+
+UI.InputBegan:Connect(function(inp,gpe)
+if gpe then
+return
+end
+
+if waiting then
+if inp.UserInputType==Enum.UserInputType.Keyboard then
+local k=inp.KeyCode
+local title=waiting
+
+waiting=nil
+
+if k==Enum.KeyCode.Escape then
+local l=waitingLbl
+waitingLbl=nil
+
+if l then
+l.Text=map[title]or"nenhuma"
+end
+else
+map[title]=k.Name
+
+local l=waitingLbl
+waitingLbl=nil
+
+if l then
+l.Text=k.Name
+end
+
+CONFIG.MarkDirty()
+end
+end
+
+return
+end
+
+if inp.UserInputType~=Enum.UserInputType.Keyboard then
+return
+end
+
+for _,title in ipairs(LIST)do
+if map[title]==inp.KeyCode.Name then
+local ctl=controls[title]
+
+if ctl then
+ctl.set(not ctl.get(),true)
+
+if NOTIFY and SET.notify then
+NOTIFY.Show(title..(ctl.get() and": ligado" or": desligado"),ctl.get() and"on" or"off")
+end
+end
+
+return
+end
+end
+end)
+
+local function Dump()
+local out={}
+
+for _,title in ipairs(LIST)do
+if map[title] then
+out[#out+1]={title,map[title]}
+end
+end
+
+return out
+end
+
+local function Load(list)
+if type(list)~="table" then
+return
+end
+
+for _,row in ipairs(list)do
+if type(row)=="table"
+and row[1]
+and row[2] then
+for _,title in ipairs(LIST)do
+if title==row[1] then
+map[title]=row[2]
+break
+end
+end
+end
+end
+
+for _,r in ipairs(rows)do
+if r[2] then
+r[2].Text=map[r[1]]or"nenhuma"
+end
+end
+end
+
+local function Create(parent,y)
+N("TextLabel",{
+Parent=parent,
+Position=UDim2.fromOffset(14,y),
+Size=UDim2.new(1,-28,0,18),
+BackgroundTransparency=1,
+Text="Atalhos de teclado",
+Font=Enum.Font.GothamMedium,
+TextSize=13,
+TextColor3=Color3.fromRGB(220,220,225),
+TextXAlignment=Enum.TextXAlignment.Left
+})
+
+y=y+26
+
+for _,title in ipairs(LIST)do
+local ctl=controls[title]
+
+if ctl then
+local row=N("TextButton",{
+Parent=parent,
+Position=UDim2.fromOffset(14,y),
+Size=UDim2.new(1,-28,0,38),
+BackgroundColor3=Color3.fromRGB(23,23,28),
+BorderSizePixel=0,
+Text="",
+AutoButtonColor=false
+})
+
+R(row,7)
+
+softStroke(
+row,
+Color3.fromRGB(48,48,55),
+.5,
+1
+)
+
+N("TextLabel",{
+Parent=row,
+Position=UDim2.fromOffset(12,0),
+Size=UDim2.new(1,-100,1,0),
+BackgroundTransparency=1,
+Text=title,
+Font=Enum.Font.Gotham,
+TextSize=12,
+TextColor3=Color3.fromRGB(200,201,210),
+TextXAlignment=Enum.TextXAlignment.Left,
+TextYAlignment=Enum.TextYAlignment.Center
+})
+
+local pill=N("Frame",{
+Parent=row,
+AnchorPoint=Vector2.new(1,.5),
+Position=UDim2.new(1,-12,.5,0),
+Size=UDim2.fromOffset(84,23),
+BackgroundColor3=Color3.fromRGB(29,29,35),
+BorderSizePixel=0
+})
+
+R(pill,7)
+
+local lbl=N("TextLabel",{
+Parent=pill,
+Size=UDim2.fromScale(1,1),
+BackgroundTransparency=1,
+Text=map[title]or"nenhuma",
+Font=Enum.Font.GothamBold,
+TextSize=10,
+TextColor3=ACCENT,
+TextXAlignment=Enum.TextXAlignment.Center,
+TextYAlignment=Enum.TextYAlignment.Center
+})
+
+rows[#rows+1]={title,lbl}
+y=y+42
+
+row.MouseButton1Click:Connect(function()
+if not SET.recordBinds then
+if NOTIFY then
+NOTIFY.Show("Ligue 'Gravar atalhos' para editar as teclas","warn")
+end
+
+return
+end
+
+if controls[title] then
+waiting=title
+waitingLbl=lbl
+flash(lbl)
+end
+end)
+end
+end
+
+return y
+end
+
+local saved=CONFIG.GetBinds()
+
+if saved then
+Load(saved)
+end
+
+return{
+Dump=Dump,
+Load=Load,
+Create=Create,
+List=LIST
+}
+end)()
 
 -- ============================================================
 -- 4) RUNTIME / GAMEPLAY SERVICES
@@ -4438,6 +5163,182 @@ local player=P.LocalPlayer
 
 local espHighlights={}
 local espTags={}
+
+-- ============================================================
+-- DETECCAO DE EQUIPE
+-- Descobre sozinho como o jogo separa inimigo de aliado, nessa ordem:
+-- TeamsService, atributo (Team/team/TeamId) no Player, ObjectValue/ValueBase
+-- dentro do Player e, por ultimo, nenhum sistema (todos sao inimigos).
+-- O resultado fica em cache por personagem e e limpo quando alguem sai.
+-- ============================================================
+local TEAMS=(function()
+local cache=setmetatable({},{__mode="k"})
+
+local function plrOf(char)
+return P:GetPlayerFromCharacter(char)
+end
+
+local function viaService(pl)
+if pl
+and pl.Team
+and not pl.Neutral then
+return pl.Team.Name
+end
+
+return nil
+end
+
+local function viaAttribute(pl)
+if not pl then
+return nil
+end
+
+for _,n in ipairs({"Team","team","TeamId","teamId","Faction"})do
+local v=pl:GetAttribute(n)
+
+if type(v)=="string" and v~="" then
+return v
+end
+end
+
+return nil
+end
+
+local function viaValue(pl)
+if not pl then
+return nil
+end
+
+for _,n in ipairs({"Team","team","Group","group","Faction","faction"})do
+local v=pl:FindFirstChild(n)
+
+if v then
+if v:IsA("ObjectValue") then
+local ov=v.Value
+
+if ov then
+return ov.Name
+end
+elseif v:IsA("ValueBase")then
+local sv=tostring(v.Value)
+
+if sv and sv~="" then
+return sv
+end
+end
+end
+end
+
+return nil
+end
+
+local function teamOf(char)
+if not char then
+return nil
+end
+
+local hit=cache[char]
+
+if hit~=nil then
+return hit or nil
+end
+
+local pl=plrOf(char)
+local t=viaService(pl)or viaAttribute(pl)or viaValue(pl)
+
+cache[char]=t or false
+
+return t
+end
+
+local function normalize(v)
+if type(v)~="string" then
+return nil
+end
+
+local s=string.lower(v)
+
+if s:find("red")
+or s:find("inimig")
+or s:find("enemy")
+or s:find("hostil")
+or s:find("mau")
+then
+return "red"
+end
+
+if s:find("blue")
+or s:find("aliad")
+or s:find("ally")
+or s:find("friendly")
+or s:find("azul")
+then
+return "blue"
+end
+
+return s
+end
+
+local function IsEnemy(char)
+if not char then
+return false
+end
+
+if char==player.Character then
+return false
+end
+
+local a=normalize(teamOf(player.Character))
+local b=normalize(teamOf(char))
+
+if not a or not b then
+return true
+end
+
+return a~=b
+end
+
+local function Color(char,base)
+if not SET.espTeamColor then
+return base
+end
+
+local pl=plrOf(char)
+local t=viaService(pl)
+
+if t then
+local ok,team=pcall(function()
+return pl.Team
+end)
+
+if ok and team and team.TeamColor then
+return team.TeamColor.Color
+end
+end
+
+local n=normalize(viaAttribute(pl)or viaValue(pl))
+
+if n=="red" then
+return Color3.fromRGB(235,70,70)
+elseif n=="blue" then
+return Color3.fromRGB(70,140,235)
+end
+
+return base
+end
+
+local function Refresh()
+table.clear(cache)
+end
+
+P.PlayerRemoving:Connect(Refresh)
+
+return{
+IsEnemy=IsEnemy,
+Color=Color,
+Refresh=Refresh
+}
+end)()
 
 local function getTargets()
 local ts={}
@@ -4476,62 +5377,156 @@ return ts
 end
 
 local function isEnemy(char)
-local pl=P:GetPlayerFromCharacter(char)
-
-if not pl then
-return true
-end
-
-local myT,plT=player.Team,pl.Team
-
-if myT
-and plT
-and not player.Neutral
-and not pl.Neutral then
-
-return myT~=plT
-end
-
-return true
+return TEAMS.IsEnemy(char)
 end
 
 local function espColorFor(char,base)
-if SET.espTeamColor then
-local pl=P:GetPlayerFromCharacter(char)
-local tm=pl and pl.Team and pl.Team.TeamColor.Color
-
-if tm then
-return tm
-end
+return TEAMS.Color(char,base)
 end
 
-return base
+-- ============================================================
+-- ESP AVANCADO
+-- Distancia e HP sao atualizados por frame (o refreshESP cria a estrutura,
+-- o loop abaixo so escreve texto/transparencia), o que mantem o custo baixo e
+-- evita recriar Highlight/BillboardGui a cada frame.
+-- ============================================================
+local BASE_FILL=.4
+
+local function inRange(dist)
+return dist>=SET.espMinDist and dist<=SET.espMaxDist
+end
+
+local function fillFor(dist)
+if not SET.espFade then
+return BASE_FILL
+end
+
+local a,b=SET.espMinDist,SET.espMaxDist
+
+if b<=a then
+return BASE_FILL
+end
+
+local f=math.clamp((dist-a)/(b-a),0,1)
+
+return .12+f*.72
+end
+
+local function tagLabel(bg,name,yOff,h,text,size,col)
+return N("TextLabel",{
+Parent=bg,
+Name=name,
+Position=UDim2.fromOffset(0,yOff),
+Size=UDim2.new(1,0,0,h),
+BackgroundTransparency=1,
+Text=text,
+Font=Enum.Font.GothamBold,
+TextSize=size,
+TextColor3=col or Color3.new(1,1,1),
+TextStrokeTransparency=.15,
+TextXAlignment=Enum.TextXAlignment.Center
+})
 end
 
 local function clearESP()
 for char,hl in pairs(espHighlights)do if hl and hl.Parent then hl:Destroy()end espHighlights[char]=nil end
 for char,bg in pairs(espTags)do if bg and bg.Parent then bg:Destroy()end espTags[char]=nil end
 for _,char in ipairs(getTargets())do
- local hl=char:FindFirstChild("PracticeESP_Highlight")if hl then hl:Destroy()end
- local bg=char:FindFirstChild("PracticeESP_Tag")if bg then bg:Destroy()end
+local hl=char:FindFirstChild("PracticeESP_Highlight")if hl then hl:Destroy()end
+local bg=char:FindFirstChild("PracticeESP_Tag")if bg then bg:Destroy()end
 end
 end
+
 local function refreshESP()
 clearESP()if not SET.espEnabled then return end
+local wantTag=SET.espNames or SET.espBoxes or SET.espDistance or SET.espHealth
+
 for _,char in ipairs(getTargets())do
- if(char==player.Character and SET.espShowSelf)or(char~=player.Character and isEnemy(char))then
-  local color=espColorFor(char,SET.espColor)
-  local hl=Instance.new("Highlight")hl.Name="PracticeESP_Highlight"hl.FillColor=color hl.OutlineColor=Color3.new(0,0,0)hl.FillTransparency=.4 hl.OutlineTransparency=.3 hl.Parent=char espHighlights[char]=hl
-  local head=char:FindFirstChild("Head")or char:FindFirstChild("HumanoidRootPart")or char.PrimaryPart
-  if head and(SET.espNames or SET.espBoxes)then
-   local bg=Instance.new("BillboardGui")bg.Name="PracticeESP_Tag"bg.AlwaysOnTop=true bg.Adornee=head bg.Size=UDim2.fromScale(3*math.max(head.Size.X,1),8)bg.StudsOffsetWorldSpace=Vector3.new(0,head.Size.Y*1.4,0)bg.ClipsDescendants=false
-   if SET.espNames then local nm=Instance.new("TextLabel")local pl=P:GetPlayerFromCharacter(char)nm.Size=UDim2.fromScale(1,.5)nm.BackgroundTransparency=1 nm.Text=pl and pl.Name or "Inimigo"nm.Font=Enum.Font.GothamBold nm.TextSize=14 nm.TextColor3=Color3.new(1,1,1)nm.TextStrokeTransparency=.1 nm.Parent=bg end
-   if SET.espBoxes then local bx=Instance.new("Frame")bx.Size=UDim2.new(1,0,2,0)bx.Position=UDim2.new(0,-.5,.5,0)bx.BackgroundTransparency=1 bx.BorderSizePixel=0 bx.Parent=bg N("UIStroke",{Parent=bx,Color=color,Thickness=1.5,Transparency=.2})end
-   bg.Parent=char espTags[char]=bg
-  end
- end
+if(char==player.Character and SET.espShowSelf)or(char~=player.Character and isEnemy(char))then
+local color=espColorFor(char,SET.espColor)
+local hl=Instance.new("Highlight")hl.Name="PracticeESP_Highlight"hl.FillColor=color hl.OutlineColor=Color3.new(0,0,0)hl.FillTransparency=BASE_FILL hl.OutlineTransparency=.3 hl.Parent=char espHighlights[char]=hl
+local head=char:FindFirstChild("Head")or char:FindFirstChild("HumanoidRootPart")or char.PrimaryPart
+
+if head and wantTag then
+local bg=Instance.new("BillboardGui")bg.Name="PracticeESP_Tag"bg.AlwaysOnTop=true bg.Adornee=head bg.Size=UDim2.fromScale(3*math.max(head.Size.X,1),8)bg.StudsOffsetWorldSpace=Vector3.new(0,head.Size.Y*1.4,0)bg.ClipsDescendants=false
+
+if SET.espNames then local pl=P:GetPlayerFromCharacter(char) tagLabel(bg,"NameLbl",0,2.4,pl and pl.Name or "Inimigo",14) end
+if SET.espDistance then tagLabel(bg,"DistLbl",2.4,1.8,"0 studs",11,color) end
+
+if SET.espHealth then
+tagLabel(bg,"HpLbl",4.2,1.8,"0",11,Color3.fromRGB(120,230,120))
+local rail=N("Frame",{Parent=bg,Name="HpRail",Position=UDim2.fromOffset(6,6.1),Size=UDim2.new(1,-12,0,.8),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=.55,BorderSizePixel=0})
+N("UICorner",{Parent=rail,CornerRadius=UDim.new(1,0)})
+N("Frame",{Parent=rail,Name="HpFill",Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(90,225,110),BorderSizePixel=0})
+end
+
+if SET.espBoxes then local bx=N("Frame",{Parent=bg,Name="Box",Size=UDim2.new(1,0,2,0),Position=UDim2.new(0,-.5,.5,0),BackgroundTransparency=1,BorderSizePixel=0}) N("UIStroke",{Parent=bx,Color=color,Thickness=1.5,Transparency=.2})end
+
+bg.Parent=char espTags[char]=bg
 end
 end
+end
+end
+
+-- Atualiza por frame: texto de distancia, vida, barra e fade.
+RC(RunService.RenderStepped,function()
+if not SET.espEnabled then return end
+local cam=workspace.CurrentCamera
+if not cam then return end
+local cp=cam.CFrame.Position
+
+for char,bg in pairs(espTags)do
+if bg and bg.Parent then
+local pt=char:FindFirstChild("HumanoidRootPart")or char.PrimaryPart
+local hl=espHighlights[char]
+local vis=pt~=nil
+
+if vis then
+local d=(pt.Position-cp).Magnitude
+vis=inRange(d)
+
+if vis then
+if hl then hl.FillTransparency=fillFor(d) end
+local dn=bg:FindFirstChild("DistLbl")
+if dn then dn.Text=math.floor(d).." studs" end
+local hum=char:FindFirstChildOfClass("Humanoid")
+
+if hum then
+local hh=bg:FindFirstChild("HpLbl")
+
+if hh then hh.Text=math.ceil(hum.Health).."/"..math.ceil(hum.MaxHealth) end
+
+local hf=bg:FindFirstChild("HpFill")
+
+if hf then
+local r=math.clamp(hum.Health/math.max(hum.MaxHealth,1),0,1)
+hf.Size=UDim2.fromScale(r,1)
+hf.BackgroundColor3=Color3.fromRGB(math.round(235-145*r),math.round(70+160*r),70)
+end
+end
+end
+end
+
+bg.Enabled=vis
+
+if hl then hl.Enabled=vis end
+end
+end
+end)
+
+-- ============================================================
+-- GRAVIDADE
+-- ============================================================
+local DEFAULT_GRAVITY=workspace.Gravity
+
+local function applyGravity()
+pcall(function()
+workspace.Gravity=SET.gravityOn and SET.gravity or DEFAULT_GRAVITY
+end)
+end
+
+applyGravity()
+
 local tracerLines={}
 local tracerLabels={}
 
@@ -4600,6 +5595,8 @@ or char:FindFirstChild("HumanoidRootPart")
 
 if pt then
 local sp=pt.Position
+local dst=(sp-cs).Magnitude
+local inR=inRange(dst)
 
 local col=espColorFor(char,SET.espColor)
 
@@ -4617,7 +5614,8 @@ end
 line.Color=col
 local p2=Vector2.new(rs.X/2,rs.Y)
 local screen,vis=cam:WorldToViewportPoint(sp)
-line.Visible=vis
+line.Visible=vis and inR
+if SET.espFade then line.Transparency=fillFor(dst) end
 
 line.From=p2
 line.To=Vector2.new(screen.X,screen.Y)
@@ -4646,8 +5644,8 @@ end
 end
 
 if lbl then
-lbl.Visible=vis
-lbl.Text=math.floor((sp-cs).Magnitude).." studs"
+lbl.Visible=vis and inR
+lbl.Text=math.floor(dst).." studs"
 lbl.Position=Vector2.new(screen.X,screen.Y-16)
 lbl.Color=col
 end
@@ -5125,7 +6123,161 @@ end
 end
 end)
 
+-- ============================================================
+-- AIMBOT AVANCADO
+-- Diferencas em relacao a versao anterior:
+--   - escolha de hitbox por prioridade (Head > Torso > HumanoidRootPart),
+--     com desempate por menor angulo dentro do mesmo personagem;
+--   - checagem de visao por raycast, para nao mirar atraves de parede;
+--   - predicao de movimento (hitscan usa um latency fixo, projetil usa a
+--     velocidade de projetil configurada);
+--   - distancia maxima e circulo de FOV desenhado na tela.
+-- O alvo fica em AIM_TARGET/AIM_HP para o auto trigger reaproveitar.
+-- ============================================================
+local AIM=(function()
+local HITBOXES={
+{name="Head",w=1},
+{name="UpperTorso",w=.88},
+{name="Torso",w=.84},
+{name="LowerTorso",w=.62},
+{name="HumanoidRootPart",w=.42}
+}
+
+local ray=RaycastParams.new()
+ray.FilterType=Enum.RaycastFilterType.Exclude
+
+local circleOK=pcall(function()
+local d=Drawing.new("Circle")
+d:Destroy()
+end)
+
+local circle=nil
+
+if circleOK then
+circle=Drawing.new("Circle")
+circle.Thickness=1
+circle.NumSides=64
+circle.Filled=false
+circle.Transparency=.75
+circle.Visible=false
+circle.Color=ACCENT
+end
+
+local function visible(from,to,char)
+ray.FilterDescendantsInstances={player.Character,char}
+local dir=to-from
+
+if dir.Magnitude<.001 then
+return true
+end
+
+return workspace:Raycast(from,dir,ray)==nil
+end
+
+local function bestHitbox(char,camPos,camLook,maxAng)
+local best,bestScore=nil,-1e9
+
+for _,h in ipairs(HITBOXES)do
+local p=char:FindFirstChild(h.name)
+
+if p and p:IsA("BasePart")then
+local delta=p.Position-camPos
+local mag=delta.Magnitude
+
+if mag>.001 then
+local ang=math.deg(
+math.acos(
+math.clamp(camLook:Dot(delta.Unit),-1,1)
+)
+)
+
+if ang<=maxAng then
+local score=(1-(ang/math.max(SET.aimFOV,1)))*h.w*10
+
+if score>bestScore then
+bestScore=score
+best=p
+end
+end
+end
+end
+end
+
+return best
+end
+
+local function predict(part,camPos)
+local pos=part.Position
+
+if not SET.aimPredict then
+return pos
+end
+
+local v=part.AssemblyVelocity
+
+if v.Magnitude<.5 then
+return pos
+end
+
+local d=(pos-camPos).Magnitude
+local t=SET.aimProjSpeed>0 and d/SET.aimProjSpeed or .055
+
+return pos+v*t
+end
+
+local function pickTarget(cam,camPos,camLook)
+local best,bestAng=nil,SET.aimFOV
+
+for _,t in ipairs(getTargets())do
+if t==player.Character or not isEnemy(t)then
+continue
+end
+
+local hum=t:FindFirstChildOfClass("Humanoid")
+
+if hum and hum.Health<=0 then
+continue
+end
+
+local hd=bestHitbox(t,camPos,camLook,SET.aimFOV)
+
+if hd then
+local d=(hd.Position-camPos).Magnitude
+
+if d<=SET.aimMaxDist then
+local ang=math.deg(
+math.acos(
+math.clamp(camLook:Dot((hd.Position-camPos).Unit),-1,1)
+)
+)
+
+if ang<bestAng
+and(not SET.aimOnlyVisible or visible(camPos,hd.Position,t))then
+bestAng=ang
+best=hd
+end
+end
+end
+end
+
+return best
+end
+
 RC(RunService.RenderStepped,function()
+if circle then
+circle.Visible=SET.aimbotEnabled and SET.aimShowFov
+local vp=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+
+if circle.Visible and vp then
+local r=math.tan(math.rad(math.clamp(SET.aimFOV,1,360)/2))*(vp.Y/2)
+circle.Radius=r
+circle.Position=Vector2.new(vp.X/2,vp.Y/2)
+end
+end
+
+AIM_TARGET=nil
+AIM_HP=nil
+
 if not SET.aimbotEnabled then
 return
 end
@@ -5138,70 +6290,129 @@ if not(cam and root)then
 return
 end
 
+if SET.freecamEnabled then
+return
+end
+
 local camPos=cam.CFrame.Position
 local camLook=cam.CFrame.LookVector
-
-local best=nil
-local bestAng=SET.aimFOV
-
-for _,t in ipairs(getTargets())do
-if t==char then
-continue
-end
-
-if not isEnemy(t)then
-continue
-end
-
-local hd=t:FindFirstChild("Head")or t.PrimaryPart
-
-if hd then
-local delta=hd.Position-camPos
-
-if delta.Magnitude>.001 then
-local dir=delta.Unit
-
-local ang=math.deg(
-math.acos(
-math.clamp(
-camLook:Dot(dir),
--1,
-1
-)
-)
-)
-
-if ang<=bestAng then
-best=hd.Position
-bestAng=ang
-end
-end
-end
-end
+local best=pickTarget(cam,camPos,camLook)
 
 if best then
-local alpha=
-1/
-(
-math.max(
-SET.aimSmooth,
-1
-)+
-1
-)
+AIM_TARGET=best
+AIM_HP=best.Parent and best.Parent:FindFirstChildOfClass("Humanoid") or nil
 
-cam.CFrame=
-cam.CFrame:Lerp(
-CFrame.lookAt(
-camPos,
-best
-),
-alpha
-)
+local aimAt=predict(best,camPos)
+local alpha=1/(math.max(SET.aimSmooth,1)+1)
+
+cam.CFrame=cam.CFrame:Lerp(CFrame.lookAt(camPos,aimAt),alpha)
 end
 end)
 
+return{
+Pick=function()
+if not SET.aimbotEnabled then
+return nil
+end
+
+local cam=workspace.CurrentCamera
+
+if not cam then
+return nil
+end
+
+return pickTarget(cam,cam.CFrame.Position,cam.CFrame.LookVector)
+end
+}
+end)()
+
+-- ============================================================
+-- AUTO TRIGGER
+-- Procura um RemoteEvent de ataque/shoot/fire dentro do ReplicatedStorage e
+-- dispara quando existe alvo travado. Se o jogo nao usa remote, cai no
+-- Tool:Activate(). Tudo e opcional (padrao desligado) e pcall-guarded.
+-- ============================================================
+local TRIGGER=(function()
+local remote=nil
+local last=0
+
+local function scan()
+remote=nil
+
+for _,c in ipairs(Repl:GetDescendants())do
+if c:IsA("RemoteEvent")then
+local n=string.lower(c.Name)
+
+if n:find("attack")
+or n:find("shoot")
+or n:find("fire")
+or n:find("hit")then
+remote=c
+return
+end
+end
+end
+end
+
+scan()
+
+Repl.DescendantAdded:Connect(function(c)
+if c:IsA("RemoteEvent")then
+task.wait(.4)
+scan()
+end
+end)
+
+local function fire()
+local now=os.clock()*1000
+
+if now-last<SET.triggerDelay then
+return
+end
+
+last=now
+
+pcall(function()
+if remote then
+remote:FireServer()
+end
+
+local tool=player.Character
+and player.Character:FindFirstChildOfClass("Tool")
+
+if tool then
+tool:Activate()
+end
+end)
+end
+
+RC(RunService.RenderStepped,function()
+if not SET.triggerOn then
+return
+end
+
+if not AIM_TARGET then
+return
+end
+
+local hum=AIM_HP
+
+if hum and hum.Health<=0 then
+return
+end
+
+fire()
+end)
+
+return{Fire=fire,Scan=scan,Found=function()
+return remote~=nil
+end}
+end)()
+
+
 RC(player.CharacterAdded,function()
+TEAMS.Refresh()
+
 if SET.noclipEnabled then
 noclipping()
 end
@@ -5791,6 +7002,142 @@ SET.freecamSpeed=math.round(v)
 end
 )
 
+mkToggle(
+pframe,
+y,
+"So alvos visiveis",
+"Raycast: ignora quem esta atras de parede",
+function(on)
+SET.aimOnlyVisible=on
+end,
+SET.aimOnlyVisible
+)
+
+y=y+58
+
+mkToggle(
+pframe,
+y,
+"Predicao de movimento",
+"Compensa o movimento do alvo",
+function(on)
+SET.aimPredict=on
+end,
+SET.aimPredict
+)
+
+y=y+58
+
+mkToggle(
+pframe,
+y,
+"Mostrar circulo do FOV",
+"Desenha o raio do aimbot na tela",
+function(on)
+SET.aimShowFov=on
+end,
+SET.aimShowFov
+)
+
+y=y+58
+
+mkSlider(
+pframe,
+y,
+"Velocidade do projetil",
+0,
+300,
+0,
+"studs/s",
+SET.aimProjSpeed,
+function(v)
+SET.aimProjSpeed=math.round(v)
+end
+)
+
+y=y+84
+
+mkSlider(
+pframe,
+y,
+"Distancia maxima do Aimbot",
+50,
+3000,
+0,
+"studs",
+SET.aimMaxDist,
+function(v)
+SET.aimMaxDist=math.round(v)
+end
+)
+
+y=y+84
+
+mkToggle(
+pframe,
+y,
+"Auto trigger",
+"Dispara sozinho quando ha alvo travado",
+function(on)
+SET.triggerOn=on
+
+if NOTIFY and on then
+NOTIFY.Show(
+TRIGGER.Found()and"Remote de ataque encontrado"or"Nenhum remote encontrado: usando a Tool",
+TRIGGER.Found()and"info"or"warn"
+)
+end
+end,
+SET.triggerOn
+)
+
+y=y+58
+
+mkSlider(
+pframe,
+y,
+"Delay do trigger",
+0,
+1000,
+0,
+"ms",
+SET.triggerDelay,
+function(v)
+SET.triggerDelay=math.round(v)
+end
+)
+
+y=y+84
+
+mkToggle(
+pframe,
+y,
+"Gravidade",
+"Controla a gravidade do Workspace",
+function(on)
+SET.gravityOn=on
+applyGravity()
+end,
+SET.gravityOn
+)
+
+y=y+58
+
+mkSlider(
+pframe,
+y,
+"Forca da gravidade",
+0,
+500,
+0,
+"studs/s2",
+SET.gravity,
+function(v)
+SET.gravity=math.round(v)
+applyGravity()
+end
+)
+
 y=y+84
 
 pframe:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
@@ -5983,6 +7330,79 @@ refreshESP()
 end
 )
 
+vy=vy+58
+
+mkToggle(
+vframe,
+vy,
+"Distancia no ESP",
+"Mostra quantos studs o alvo esta",
+function(on)
+SET.espDistance=on
+refreshESP()
+end,
+SET.espDistance
+)
+
+vy=vy+58
+
+mkToggle(
+vframe,
+vy,
+"Vida (HP) no ESP",
+"Mostra vida atual e maxima + barra",
+function(on)
+SET.espHealth=on
+refreshESP()
+end,
+SET.espHealth
+)
+
+vy=vy+58
+
+mkToggle(
+vframe,
+vy,
+"Fade por distancia",
+"Alvos longe ficam mais transparentes",
+function(on)
+SET.espFade=on
+end,
+SET.espFade
+)
+
+vy=vy+58
+
+mkSlider(
+vframe,
+vy,
+"Distancia minima do ESP",
+0,
+3000,
+0,
+"studs",
+SET.espMinDist,
+function(v)
+SET.espMinDist=math.round(v)
+end
+)
+
+vy=vy+84
+
+mkSlider(
+vframe,
+vy,
+"Distancia maxima do ESP",
+100,
+5000,
+0,
+"studs",
+SET.espMaxDist,
+function(v)
+SET.espMaxDist=math.round(v)
+end
+)
+
 vy=vy+84
 
 vframe:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
@@ -6117,6 +7537,65 @@ applyTheme(SET.theme)
 
 sy=sy+58
 
+mkToggle(
+sframe,
+sy,
+"Notificacoes",
+"Toast no canto da tela ao ligar/desligar",
+function(on)
+SET.notify=on
+end,
+SET.notify
+)
+
+sy=sy+58
+
+mkToggle(
+sframe,
+sy,
+"Sons",
+"Som ao ligar/desligar (precisa de um id em SET.soundId)",
+function(on)
+SET.sound=on
+end,
+SET.sound
+)
+
+sy=sy+58
+
+mkToggle(
+sframe,
+sy,
+"Salvar config",
+"Grava as configuracoes em PracticePlus/config.json",
+function(on)
+SET.saveCfg=on
+
+if on then
+CONFIG.MarkDirty()
+end
+end,
+SET.saveCfg
+)
+
+sy=sy+58
+
+mkToggle(
+sframe,
+sy,
+"Gravar atalhos",
+"Permite clicar numa linha e apertar a tecla",
+function(on)
+SET.recordBinds=on
+end,
+SET.recordBinds
+)
+
+sy=sy+58
+
+sy=KEYBINDS.Create(sframe,sy)
+sy=sy+16
+
 local resetBtn=N("TextButton",{
 Parent=sframe,
 Position=UDim2.fromOffset(14,sy),
@@ -6163,13 +7642,51 @@ SET.zoomFOV=0
 SET.freecamSpeed=200
 SET.godMode=false
 
+-- Pacote novo
+SET.aimMaxDist=600
+SET.aimOnlyVisible=true
+SET.aimPredict=true
+SET.aimProjSpeed=0
+SET.aimShowFov=false
+SET.espDistance=false
+SET.espHealth=false
+SET.espFade=false
+SET.espMinDist=0
+SET.espMaxDist=2000
+SET.triggerDelay=120
+SET.gravityOn=false
+SET.gravity=196.2
+
 SET.espColor=Color3.fromRGB(235,70,70)
 SET.espEnabled=false
-local defaults={['FOV do Aimbot']=150,['Suavidade do Aimbot']=4,['Velocidade']=16,['Forca do pulo']=50,['Tamanho do Hitbox']=1.5,['Velocidade do Fly']=50,['Velocidade da Free Cam']=200,['Vermelho']=235,['Verde']=70,['Azul']=70,['Zoom da camera (FOV)']=0}
+local defaults={['FOV do Aimbot']=150,['Suavidade do Aimbot']=4,['Velocidade']=16,['Forca do pulo']=50,['Tamanho do Hitbox']=1.5,['Velocidade do Fly']=50,['Velocidade da Free Cam']=200,['Vermelho']=235,['Verde']=70,['Azul']=70,['Zoom da camera (FOV)']=0,['So alvos visiveis']=true,['Predicao de movimento']=true,['Velocidade do projetil']=0,['Distancia maxima do Aimbot']=600,['Distancia minima do ESP']=0,['Distancia maxima do ESP']=2000,['Delay do trigger']=120,['Forca da gravidade']=196.2}
+
+local toggleDefaults={
+["Aimbot"]=false,
+["ESP"]=false,
+["Auto trigger"]=false,
+["Distancia no ESP"]=false,
+["Vida (HP) no ESP"]=false,
+["Fade por distancia"]=false,
+["Gravidade"]=false,
+["Mostrar circulo do FOV"]=false,
+["So alvos visiveis"]=true,
+["Predicao de movimento"]=true
+}
+
+for title,def in pairs(toggleDefaults)do
+local ctl=controls[title]
+
+if ctl then
+ctl.set(def)
+end
+end
 for title,v in pairs(defaults)do if sliderSetters[title]then sliderSetters[title](v)end end
 applyTheme(1)
 local resetCam=workspace.CurrentCamera if resetCam then resetCam.FieldOfView=baseFOV end
 restoreNoclip()restoreHitboxes()FREECAM.Disable()
+applyGravity()
+CONFIG.Save()
 
 setState(
 player.Character
@@ -6515,6 +8032,10 @@ end
 
 local PAGE_API=setupPages()
 
+-- A config carregada no CONFIG e aplicada nos controles recem-criados: assim o
+-- toggle anima na posicao certa e o onChange roda (fly, noclip, ESP, gravity).
+CONFIG.Apply()
+
 -- Se o Worker entregou um módulo específico para este PlaceId, executa o source
 -- recebido da API. O client não sabe nem precisa saber a URL do GitHub.
 task.spawn(function()
@@ -6525,10 +8046,13 @@ task.spawn(function()
 end)
 
 gui.Destroying:Connect(function()
-SET.flyEnabled=false SET.noclipEnabled=false SET.hitboxExpand=false SET.espEnabled=false SET.espTracers=false SET.clickTp=false SET.freecamEnabled=false
+SET.flyEnabled=false SET.noclipEnabled=false SET.hitboxExpand=false SET.espEnabled=false SET.espTracers=false SET.clickTp=false SET.freecamEnabled=false SET.triggerOn=false SET.gravityOn=false
 FREECAM.Disable()
 if flyBody then pcall(function()flyBody:Destroy()end)flyBody=nil end
 restoreNoclip()restoreHitboxes()clearESP()clearTracers()
+applyGravity()
+CONFIG.Save()
+if NOTIFY and NOTIFY.Gui then pcall(function()NOTIFY.Gui:Destroy()end)end
 local cam=workspace.CurrentCamera if cam then pcall(function()cam.FieldOfView=baseFOV end)end
 for _,c in ipairs(runtimeConnections)do pcall(function()c:Disconnect()end)end table.clear(runtimeConnections)
 end)
