@@ -10,6 +10,10 @@ end
 -- reativar é só trocar isto para true.
 local KEY_SYSTEM_ENABLED=false
 
+-- DEBUG do Click TP. false = silencioso. Ligue para ver no console cada
+-- clique detectado, o motivo de um clique ter sido ignorado e o destino.
+local DEBUG_CLICK_TP=false
+
 --[[
     PRACTICE+ - AI-FRIENDLY BUILD
 
@@ -4743,14 +4747,24 @@ end
 local function restoreNoclip()for prt,v in pairs(noclipOriginal)do if prt and prt.Parent then pcall(function()prt.CanCollide=v end)end noclipOriginal[prt]=nil end end
 
 -- CLICK TP: com o toggle ligado, cada botao esquerdo teleporta o personagem
--- para o ponto 3D onde o cursor aponta (raycast a partir da camera).
--- Cliques na propria UI do menu sao ignorados via GetObjectsAtPosition.
+-- para o ponto 3D onde o cursor aponta (raycast do UnitRay do mouse).
+--
+-- Duas decisoes importantes:
+--  1) A leitura do botao e por poll (IsMouseButtonPressed + edge-detect) em
+--     RenderStepped, e nao por UserInputService.InputBegan. InputBegan depende
+--     de como o executor injeta o script e em varios deles nunca chega.
+--  2) overUI so considera a UI do NOSSO menu (gui). Antes contava qualquer
+--     GuiObject da tela e qualquer frame invisivel de tela cheia do jogo
+--     bloqueava o TP para sempre.
+--
 -- Escopo proprio para nao aumentar os registradores locais do chunk principal
 -- (mesma ideia do bloco AUTH).
 local CLICK_TP=(function()
 local MAXDIST=1500
 local FALLBACK=600
 local LIFT=Vector3.new(0,2,0)
+local mouse=player:GetMouse()
+local down=false
 
 local function rootPart()
 local char=player.Character
@@ -4759,37 +4773,43 @@ end
 
 local function overUI(x,y)
 for _,o in ipairs(pg:GetObjectsAtPosition(x,y))do
-if o:IsA("GuiObject")then return true end
+if o:IsA("GuiObject") and o:IsDescendantOf(gui)then return true end
 end
 return false
 end
 
--- overUI fica exposto no retorno porque a Free Cam precisa do mesmo teste para
--- nao girar a camera enquanto o mouse esta sobre o menu.
+RC(RunService.RenderStepped,function()
+local pressed=UserInputService:IsMouseButtonPressed(Enum.UserType.MouseButton1)
 
-RC(UserInputService.InputBegan,function(i)
+if pressed==down then
+return
+end
+
+down=pressed
+
+if not pressed then return end
 if not SET.clickTp then return end
-if i.UserInputType~=Enum.UserInputType.MouseButton1 then return end
-if gameProcessedEvent then return end
-if overUI(i.Position.X,i.Position.Y)then return end
-local cam=workspace.CurrentCamera if not cam then return end
-local ray=cam:ScreenPointToRay(i.Position.X,i.Position.Y)
+if overUI(mouse.X,mouse.Y)then if DEBUG_CLICK_TP then warn("[Practice+] clique ignorado: sobre o menu")end return end
+
+local ray=mouse.UnitRay
+
 if not ray then return end
+
 local params=RaycastParams.new()
 params.FilterType=Enum.RaycastFilterType.Exclude
 params.FilterDescendantsInstances={player.Character}
 local hit=workspace:Raycast(ray.Origin,ray.Direction.Unit*MAXDIST,params)
 local dest=hit and hit.Position or ray.Origin+ray.Direction.Unit*FALLBACK
-local r=rootPart() if not r then return end
+local r=rootPart() if not r then if DEBUG_CLICK_TP then warn("[Practice+] clique sem HumanoidRootPart/PrimaryPart")end return end
+if DEBUG_CLICK_TP then warn(("[Practice+] TP hit=%s dest=%s"):format(tostring(hit~=nil),tostring(dest)))end
 pcall(function()r.CFrame=CFrame.new(dest+LIFT)end)
 end)
 
 return{OverUI=overUI}
 end)()
-
 -- FREECAM: solta a camera do personagem. A camera vira Scriptable e passa a ser
 -- movida por WASD (Espaco sobe, Shift desce, Ctrl acelera) e girada pelo
--- movimento do mouse. O character local fica invisivel enquanto a camera voa.
+-- mouse.Delta. O character local fica invisivel enquanto a camera voa.
 -- Escopo proprio pelos mesmos motivos do AUTH/CLICK_TP.
 local FREECAM=(function()
 local SENS=0.0025
@@ -4803,6 +4823,9 @@ local cam=nil
 local savedType=nil
 local pitch=0
 local yaw=0
+local prevL=false
+local prevR=false
+local mouse=player:GetMouse()
 local localTrans=setmetatable({},{__mode="k"})
 
 local function setLocalTransparency(on)
@@ -4856,15 +4879,16 @@ cam=nil
 savedType=nil
 end
 
-RC(UserInputService.InputChanged,function(i)
-if not live then return end
+-- Mouse lido por poll tambem: InputChanged nao e confiavel em executor.
+-- while o cursor esta sobre o menu a camera nao gira, senao a janela treme.
+local function pollLook()
+local d=mouse.Delta
 
-if i.UserInputType~=Enum.UserInputType.MouseMovement then return end
--- Girar a camera enquanto o cursor esta sobre o menu deixa a janela "tremer".
-if CLICK_TP.OverUI(i.Position.X,i.Position.Y)then return end
-yaw-=i.Delta.X*SENS
-pitch=math.clamp(pitch-i.Delta.Y*SENS,-MAXPITCH,MAXPITCH)
-end)
+if d.X==0 and d.Y==0 then return end
+if CLICK_TP.OverUI(mouse.X,mouse.Y)then return end
+yaw-=d.X*SENS
+pitch=math.clamp(pitch-d.Y*SENS,-MAXPITCH,MAXPITCH)
+end
 
 RC(RunService.RenderStepped,function(dt)
 if not live then return end
@@ -4874,6 +4898,25 @@ if workspace.CurrentCamera~=cam then
 Disable()
 return
 end
+
+pollLook()
+
+-- Setas sobem/descem em degraus. Sem isso o pitch fica preso quando o char
+-- atravessa o ponto onde mouse.Y == pitch em radianos, porque o delta vertical
+-- do mouse deixa de mudar de sinal.
+local l=UserInputService:IsMouseButtonPressed(Enum.UserType.MouseButton1)
+local r=UserInputService:IsMouseButtonPressed(Enum.UserType.MouseButton2)
+
+if l and not prevL then
+pitch=math.clamp(pitch+PITCHSTEP,-MAXPITCH,MAXPITCH)
+yaw-=STEP
+end
+
+if r and not prevR then
+pitch=math.clamp(pitch-PITCHSTEP,-MAXPITCH,MAXPITCH)
+end
+
+prevL,prevR=l,r
 
 local rot=CFrame.fromOrientation(pitch,yaw,0)
 local fwd=rot.LookVector
@@ -4896,27 +4939,12 @@ if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)then spd=spd*BOOST end
 cam.CFrame=CFrame.new(cam.CFrame.Position+mv*spd*math.min(dt,.1))*rot
 end)
 
--- Setas sobem/descem em degraus. Sem isso o pitch fica preso quando o char
--- atravessa o ponto onde mouse.Y == pitch em radianos, porque o delta vertical
--- do mouse deixa de mudar de sinal.
-RC(UserInputService.InputBegan,function(i)
-if not live then return end
-
-if i.UserInputType==Enum.UserInputType.MouseButton1 then
-pitch=math.clamp(pitch+PITCHSTEP,-MAXPITCH,MAXPITCH)
-yaw-=STEP
-elseif i.UserInputType==Enum.UserInputType.MouseButton2 then
-pitch=math.clamp(pitch-PITCHSTEP,-MAXPITCH,MAXPITCH)
-end
-end)
-
 return{
 Enable=Enable,
 Disable=Disable,
 IsLive=function() return live end
 }
 end)()
-
 RC(RunService.Heartbeat,function()
 local char=player.Character
 local humanoid=char and char:FindFirstChildOfClass("Humanoid")
