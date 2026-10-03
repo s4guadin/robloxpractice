@@ -4024,6 +4024,9 @@ aimSmooth=4,
 flyEnabled=false,
 flySpeed=50,
 noclipEnabled=false,
+clickTp=false,
+freecamEnabled=false,
+freecamSpeed=200,
 walkSpeed=16,
 jumpPower=50,
 noFallDamage=false,
@@ -4723,6 +4726,181 @@ char=char or player.Character if not char then return end
 for _,prt in ipairs(char:GetDescendants())do if prt:IsA("BasePart")then if noclipOriginal[prt]==nil then noclipOriginal[prt]=prt.CanCollide end prt.CanCollide=false end end
 end
 local function restoreNoclip()for prt,v in pairs(noclipOriginal)do if prt and prt.Parent then pcall(function()prt.CanCollide=v end)end noclipOriginal[prt]=nil end end
+
+-- CLICK TP: com o toggle ligado, cada botao esquerdo teleporta o personagem
+-- para o ponto 3D onde o cursor aponta (raycast a partir da camera).
+-- Cliques na propria UI do menu sao ignorados via GetObjectsAtPosition.
+-- Escopo proprio para nao aumentar os registradores locais do chunk principal
+-- (mesma ideia do bloco AUTH).
+local CLICK_TP=(function()
+local MAXDIST=1500
+local FALLBACK=600
+local LIFT=Vector3.new(0,2,0)
+
+local function rootPart()
+local char=player.Character
+return char and(char:FindFirstChild("HumanoidRootPart")or char.PrimaryPart)or nil
+end
+
+local function overUI(x,y)
+for _,o in ipairs(pg:GetObjectsAtPosition(x,y))do
+if o:IsA("GuiObject")then return true end
+end
+return false
+end
+
+-- overUI fica exposto no retorno porque a Free Cam precisa do mesmo teste para
+-- nao girar a camera enquanto o mouse esta sobre o menu.
+
+RC(UserInputService.InputBegan,function(i)
+if not SET.clickTp then return end
+if i.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+if gameProcessedEvent then return end
+if overUI(i.Position.X,i.Position.Y)then return end
+local cam=workspace.CurrentCamera if not cam then return end
+local ray=cam:ScreenPointToRay(i.Position.X,i.Position.Y)
+if not ray then return end
+local params=RaycastParams.new()
+params.FilterType=Enum.RaycastFilterType.Exclude
+params.FilterDescendantsInstances={player.Character}
+local hit=workspace:Raycast(ray.Origin,ray.Direction.Unit*MAXDIST,params)
+local dest=hit and hit.Position or ray.Origin+ray.Direction.Unit*FALLBACK
+local r=rootPart() if not r then return end
+pcall(function()r.CFrame=CFrame.new(dest+LIFT)end)
+end)
+
+return{OverUI=overUI}
+end)()
+
+-- FREECAM: solta a camera do personagem. A camera vira Scriptable e passa a ser
+-- movida por WASD (Espaco sobe, Shift desce, Ctrl acelera) e girada pelo
+-- movimento do mouse. O character local fica invisivel enquanto a camera voa.
+-- Escopo proprio pelos mesmos motivos do AUTH/CLICK_TP.
+local FREECAM=(function()
+local SENS=0.0025
+local MAXPITCH=1.5
+local BOOST=3
+local PITCHSTEP=math.pi/90
+local STEP=math.pi/60
+
+local live=false
+local cam=nil
+local savedType=nil
+local pitch=0
+local yaw=0
+local localTrans=setmetatable({},{__mode="k"})
+
+local function setLocalTransparency(on)
+local char=player.Character
+
+if not char then
+return
+end
+
+for _,d in ipairs(char:GetDescendants())do
+if d:IsA("BasePart")or d:IsA("Decal")then
+if on then
+if localTrans[d]==nil then localTrans[d]=d.LocalTransparencyModifier end
+d.LocalTransparencyModifier=1
+else
+d.LocalTransparencyModifier=localTrans[d]or 0
+localTrans[d]=nil
+end
+end
+end
+end
+
+local function Enable()
+if live then return end
+local target=workspace.CurrentCamera
+
+if not target then return end
+
+cam=target
+savedType=target.CameraType
+local cf=target.CFrame
+
+pitch=math.asin(math.clamp(cf.LookVector.Y,-1,1))
+yaw=math.atan2(-cf.LookVector.X,-cf.LookVector.Z)
+target.CameraType=Enum.CameraType.Scriptable
+target.CFrame=cf
+live=true
+setLocalTransparency(true)
+end
+
+local function Disable()
+if not live then return end
+live=false
+setLocalTransparency(false)
+
+if cam and cam.Parent then
+pcall(function()cam.CameraType=savedType or Enum.CameraType.Custom end)
+end
+
+cam=nil
+savedType=nil
+end
+
+RC(UserInputService.InputChanged,function(i)
+if not live then return end
+
+if i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+-- Girar a camera enquanto o cursor esta sobre o menu deixa a janela "tremer".
+if CLICK_TP.OverUI(i.Position.X,i.Position.Y)then return end
+yaw-=i.Delta.X*SENS
+pitch=math.clamp(pitch-i.Delta.Y*SENS,-MAXPITCH,MAXPITCH)
+end)
+
+RC(RunService.RenderStepped,function(dt)
+if not live then return end
+
+-- O jogo pode recriar a camera (Death/Respawn): nesse caso devolve o controle.
+if workspace.CurrentCamera~=cam then
+Disable()
+return
+end
+
+local rot=CFrame.fromOrientation(pitch,yaw,0)
+local fwd=rot.LookVector
+local right=rot.RightVector
+local mv=Vector3.zero
+
+if UserInputService:IsKeyDown(Enum.KeyCode.W)then mv=mv+fwd end
+if UserInputService:IsKeyDown(Enum.KeyCode.S)then mv=mv-fwd end
+if UserInputService:IsKeyDown(Enum.KeyCode.D)then mv=mv+right end
+if UserInputService:IsKeyDown(Enum.KeyCode.A)then mv=mv-right end
+if UserInputService:IsKeyDown(Enum.KeyCode.Space)then mv=mv+Vector3.new(0,1,0) end
+if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)then mv=mv-Vector3.new(0,1,0) end
+
+if mv.Magnitude>.001 then mv=mv.Unit end
+
+local spd=SET.freecamSpeed
+
+if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)then spd=spd*BOOST end
+
+cam.CFrame=CFrame.new(cam.CFrame.Position+mv*spd*math.min(dt,.1))*rot
+end)
+
+-- Setas sobem/descem em degraus. Sem isso o pitch fica preso quando o char
+-- atravessa o ponto onde mouse.Y == pitch em radianos, porque o delta vertical
+-- do mouse deixa de mudar de sinal.
+RC(UserInputService.InputBegan,function(i)
+if not live then return end
+
+if i.UserInputType==Enum.UserInputType.MouseButton1 then
+pitch=math.clamp(pitch+PITCHSTEP,-MAXPITCH,MAXPITCH)
+yaw-=STEP
+elseif i.UserInputType==Enum.UserInputType.MouseButton2 then
+pitch=math.clamp(pitch-PITCHSTEP,-MAXPITCH,MAXPITCH)
+end
+end)
+
+return{
+Enable=Enable,
+Disable=Disable,
+IsLive=function() return live end
+}
+end)()
 
 RC(RunService.Heartbeat,function()
 local char=player.Character
@@ -5531,6 +5709,47 @@ end
 
 y=y+58
 
+local clickTpTog=mkToggle(
+pframe,
+y,
+"Click TP",
+"Clique esquerdo vai para onde o mouse aponta",
+function(on)
+SET.clickTp=on
+end
+)
+
+y=y+58
+
+local freecamTog=mkToggle(
+pframe,
+y,
+"Free Cam",
+"Camera solta: WASD move, mouse gira",
+function(on)
+SET.freecamEnabled=on
+if on then FREECAM.Enable() else FREECAM.Disable() end
+end
+)
+
+y=y+58
+
+mkSlider(
+pframe,
+y,
+"Velocidade da Free Cam",
+20,
+600,
+10,
+"studs/s",
+SET.freecamSpeed,
+function(v)
+SET.freecamSpeed=math.round(v)
+end
+)
+
+y=y+84
+
 pframe:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
 scroll.CanvasSize=UDim2.fromOffset(0,pframe.AbsoluteSize.Y+12)
 end)
@@ -5878,6 +6097,8 @@ godTog,
 hitboxTog,
 flyTog,
 noclipTog,
+clickTpTog,
+freecamTog,
 espColTog,
 espNamesTog,
 espTracersTog,
@@ -5896,15 +6117,16 @@ SET.walkSpeed=16
 SET.jumpPower=50
 SET.hitboxSize=1.5
 SET.zoomFOV=0
+SET.freecamSpeed=200
 SET.godMode=false
 
 SET.espColor=Color3.fromRGB(235,70,70)
 SET.espEnabled=false
-local defaults={['FOV do Aimbot']=150,['Suavidade do Aimbot']=4,['Velocidade']=16,['Forca do pulo']=50,['Tamanho do Hitbox']=1.5,['Velocidade do Fly']=50,['Vermelho']=235,['Verde']=70,['Azul']=70,['Zoom da camera (FOV)']=0}
+local defaults={['FOV do Aimbot']=150,['Suavidade do Aimbot']=4,['Velocidade']=16,['Forca do pulo']=50,['Tamanho do Hitbox']=1.5,['Velocidade do Fly']=50,['Velocidade da Free Cam']=200,['Vermelho']=235,['Verde']=70,['Azul']=70,['Zoom da camera (FOV)']=0}
 for title,v in pairs(defaults)do if sliderSetters[title]then sliderSetters[title](v)end end
 applyTheme(1)
 local resetCam=workspace.CurrentCamera if resetCam then resetCam.FieldOfView=baseFOV end
-restoreNoclip()restoreHitboxes()
+restoreNoclip()restoreHitboxes()FREECAM.Disable()
 
 setState(
 player.Character
@@ -6260,7 +6482,8 @@ task.spawn(function()
 end)
 
 gui.Destroying:Connect(function()
-SET.flyEnabled=false SET.noclipEnabled=false SET.hitboxExpand=false SET.espEnabled=false SET.espTracers=false
+SET.flyEnabled=false SET.noclipEnabled=false SET.hitboxExpand=false SET.espEnabled=false SET.espTracers=false SET.clickTp=false SET.freecamEnabled=false
+FREECAM.Disable()
 if flyBody then pcall(function()flyBody:Destroy()end)flyBody=nil end
 restoreNoclip()restoreHitboxes()clearESP()clearTracers()
 local cam=workspace.CurrentCamera if cam then pcall(function()cam.FieldOfView=baseFOV end)end

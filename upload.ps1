@@ -23,4 +23,4 @@ git push origin main
 
 Write-Host ""
 Write-Host "== Pronto! Rode no Solara:" -ForegroundColor Green
-Write-Host 'loadstring(game:HttpGet("https://raw.githubusercontent.com/s4guadin/robloxpractice/main/PracticeIntro.lua"))()' -ForegroundColor Yellow
+Write-Host 'loadstring(game:HttpGet("https://raw.githubusercontent.com/s4guadin/robloxpractice/main/Practice.lua"))()' -ForegroundColor Yellow
