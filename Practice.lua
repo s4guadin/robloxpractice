@@ -7002,6 +7002,8 @@ SET.freecamSpeed=math.round(v)
 end
 )
 
+y=y+84
+
 mkToggle(
 pframe,
 y,
@@ -7330,7 +7332,7 @@ refreshESP()
 end
 )
 
-vy=vy+58
+vy=vy+84
 
 mkToggle(
 vframe,
@@ -8030,17 +8032,25 @@ return {
 }
 end
 
-local PAGE_API=setupPages()
+-- O menu so fica visivel no fim do script (secao 7). Se qualquer passo aqui
+-- derrubar o script, a janela fica transparente sem explicacao. Por isso tudo
+-- que monta a UI e protegido: o erro vai para o Output e o menu ainda abre.
+local pageOK,PAGE_API=pcall(setupPages)
+
+if not pageOK then
+warn("[Practice+] setupPages falhou: "..tostring(PAGE_API))
+PAGE_API=nil
+end
 
 -- A config carregada no CONFIG e aplicada nos controles recem-criados: assim o
 -- toggle anima na posicao certa e o onChange roda (fly, noclip, ESP, gravity).
-CONFIG.Apply()
+pcall(CONFIG.Apply)
 
 -- Se o Worker entregou um módulo específico para este PlaceId, executa o source
 -- recebido da API. O client não sabe nem precisa saber a URL do GitHub.
 task.spawn(function()
-    local ok,err=GAME_ROUTER.LoadMatchedScript(PAGE_API)
-    if not ok and err~="universal" and err~="not_configured" then
+    local ok,err=pcall(function() return GAME_ROUTER.LoadMatchedScript(PAGE_API) end)
+    if not ok then
         warn("[Practice+] game router: "..tostring(err))
     end
 end)
