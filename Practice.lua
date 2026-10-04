@@ -4144,9 +4144,57 @@ local CONTROL_KEYS={
 }
 
 local CONFIG=(function()
-local FILE=KEY_DIR.."/config.json"
+-- KEY_DIR, fwrite, fread e trim pertencem ao escopo do modulo AUTH, que ja foi
+-- fechado. Este modulo repete a pasta e traz os proprios helpers de arquivo:
+-- se o executor nao expuser writefile, o jogo continua funcionando e apenas a
+-- config deixa de ser persistida.
+local DIR="PracticePlus"
+local FILE=DIR.."/config.json"
 local dirty=false
 local timer=nil
+local pending=nil
+
+local function cfgTrim(s)
+return tostring(s):match("^%s*(.-)%s*$")
+end
+
+local function cfgRead(p)
+if not(readfile and isfile)then
+return nil
+end
+
+local ok,v=pcall(function()
+if not isfile(p)then
+return nil
+end
+
+return readfile(p)
+end)
+
+if ok then
+return v
+end
+
+return nil
+end
+
+local function cfgWrite(p,v)
+if not writefile then
+return false
+end
+
+pcall(function()
+if isfolder and not isfolder(DIR)then
+makefolder(DIR)
+end
+end)
+
+local ok=pcall(function()
+writefile(p,tostring(v))
+end)
+
+return ok
+end
 
 local function dump()
 local out={}
@@ -4188,7 +4236,7 @@ if not SET.saveCfg then
 return false
 end
 
-if not fwrite(FILE,dump())then
+if not cfgWrite(FILE,dump())then
 return false
 end
 
@@ -4215,7 +4263,9 @@ end)
 end
 
 local function load()
-local raw=fread(FILE)
+pending=nil
+
+local raw=cfgRead(FILE)
 
 if not raw then
 return false
@@ -4226,10 +4276,9 @@ local bools={}
 local binds={}
 local nb=0
 local got=false
-local pending=nil
 
 for line in raw:gmatch("[^\r\n]+")do
-line=trim(line)
+line=cfgTrim(line)
 
 -- Separa so o tipo do resto. O resto precisa ser lido por tipo: um atalho
 -- ("k Aimbot|KeyB") tem espacos no titulo, entao um token unico nao serviria.
@@ -6134,7 +6183,7 @@ end)
 --   - distancia maxima e circulo de FOV desenhado na tela.
 -- O alvo fica em AIM_TARGET/AIM_HP para o auto trigger reaproveitar.
 -- ============================================================
-local AIM=(function()
+;(function()
 local HITBOXES={
 {name="Head",w=1},
 {name="UpperTorso",w=.88},
@@ -6309,21 +6358,6 @@ cam.CFrame=cam.CFrame:Lerp(CFrame.lookAt(camPos,aimAt),alpha)
 end
 end)
 
-return{
-Pick=function()
-if not SET.aimbotEnabled then
-return nil
-end
-
-local cam=workspace.CurrentCamera
-
-if not cam then
-return nil
-end
-
-return pickTarget(cam,cam.CFrame.Position,cam.CFrame.LookVector)
-end
-}
 end)()
 
 -- ============================================================
